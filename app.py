@@ -4,7 +4,6 @@ import time
 
 from hikvision_client import HikvisionClient
 from loggerinitializer import initialize_logger
-from http_service import app
 
 
 def main():
@@ -24,7 +23,7 @@ def main():
     logging.info("Starting loop manual cup")
     while True:
         # input("Press enter for manual_cup: \n")
-        cam.manual_cup(os.path.abspath(os.curdir))
+        response = cam.manual_cup(os.path.abspath(os.curdir))
 
 
 if __name__ == '__main__':

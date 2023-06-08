@@ -15,8 +15,12 @@ import xmltodict
 from requests.auth import HTTPBasicAuth, HTTPDigestAuth
 from urllib.parse import urljoin
 
-from http_service import get_local_address, app
 from model import DeviceInfo, CMSearchResult, PictureInformation, Fixation
+
+
+def human_size(bytes, units=[' bytes', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB']):
+    """ Returns a human readable string representation of bytes """
+    return str(bytes) + units[0] if bytes < 1024 else human_size(bytes >> 10, units[1:])
 
 
 class HikvisionClient:
@@ -57,70 +61,6 @@ class HikvisionClient:
         full_url = urljoin(self.host, self.isapi_prefix + '/System/deviceInfo')
         response = self.req.get(url=full_url)
         return DeviceInfo.from_xml_str(response.text)
-
-    def loop_events(self):
-        data = """
-        <SubscribeEvent version="2.0" xmlns="http://www.isapi.org/ver20/XMLSchema">
-            <heartbeat>5</heartbeat>
-            <eventMode>all</eventMode>
-            <EventList>
-            </EventList>
-        </SubscribeEvent>
-        """
-
-        while True:
-            try:
-                full_url = urljoin(self.host, self.isapi_prefix + '/Event/notification/subscribeEvent')
-                events = self.stream_request(method="post",
-                                             full_url=full_url,
-                                             data=data)
-                logging.info(f"New events: {events}")
-            except requests.ReadTimeout:
-                pass
-
-            except Exception as ex:
-                logging.error(f"Method loop_events: {ex}, {traceback.format_exc()}")
-                return
-            finally:
-                sleep(0.1)
-
-    def stream_request(self, method, full_url, time_out=30, **data):
-        events = []
-        response = self.req.request(method, full_url, timeout=time_out, stream=True, **data)
-        if response.status_code != 200:
-            logging.warning(f"Method: {full_url}, returned code: {response.status_code} with text: {response.text}")
-            return None
-
-        for chunk in response.iter_lines(chunk_size=1024, delimiter=b'--boundary'):
-            if chunk:
-                xml = chunk.split(b'\r\n\r\n')[1].decode("utf-8")
-                events.append(xml)
-                if len(events) == self.count_events:
-                    return events
-
-    def set_callback(self, local_ip, port, url):
-        logging.info(f"Set callback: {local_ip}:{port} with url: {url}")
-        data = f"""
-                <?xml version="1.0" encoding="UTF-8"?>
-                <HttpHostNotification version="2.0" xmlns="http://www.isapi.org/ver20/XMLSchema">
-                    <id>1</id>
-                    <url>/{url}</url>
-                    <protocolType>HTTP</protocolType>
-                
-                    <addressingFormatType>ipaddress</addressingFormatType>
-                    <ipAddress>{local_ip}</ipAddress>
-                    <hostName> </hostName>
-                    <portNo>{port}</portNo>
-                    <ANPR>
-                        <detectionUpLoadPicturesType>all</detectionUpLoadPicturesType>
-                    </ANPR>
-                    <eventMode>all</eventMode>
-                </HttpHostNotification>
-                """
-
-        full_url = urljoin(self.host, self.isapi_prefix + '/Event/notification/httpHosts/1')
-        response = self.req.put(url=full_url, data=data)
-        logging.info(f"Result callback: {response.status_code} with: {response.text}")
 
     def __get_pictures__(self, time_start, count=10) -> CMSearchResult:
         date_time_start = time_start.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -163,15 +103,6 @@ class HikvisionClient:
                 self.known_play_uri.append(result.play_back_uri)
                 fixation = Fixation(url=result.play_back_uri, number=meta.number, date_time=result.time_start)
                 # self.download_fixation.append(fixation)
-
-    def listener_events_server(self):
-        local_ip = get_local_address()
-        port = 5010
-        url = "test"
-        self.set_callback(local_ip, port, url)
-        #
-        logging.info("Start http listener...")
-        app.run(debug=True, port=port, host="0.0.0.0")
 
     def __get_meta_data__(self, play_back_uri) -> PictureInformation:
         request_id = uuid.uuid4()
@@ -236,27 +167,37 @@ class HikvisionClient:
         time_start = datetime.datetime.utcnow()
         full_url = urljoin(self.host, self.isapi_prefix + '/ITC/manualCap')
         response = self.req.put(url=full_url)
-        # logging.debug(f"Result: {response.status_code} with: {response.text}")
-        date = datetime.datetime.now().strftime("%Y_%d_%m_%H_%M_%S")
-        filename = date + ".jpg"
         path = os.path.join(path, "manual_pictures")
         if not os.path.exists(path):
             os.mkdir(path)
 
         if response.status_code == 200:
             response.raw.decode_content = True
-            number = self.parse_message_from_byte(response.content, unrecognized_photo_save=unrecognized_photo_save)
-            logging.debug(f"Manual Cup, time {datetime.datetime.utcnow() - time_start}: Response: {number}")
+            number, recognize = self.parse_message_from_byte(response.content,
+                                                             unrecognized_photo_save=unrecognized_photo_save,
+                                                             download_path=path)
+            if recognize:
+                logging.info(f"Detected, time {datetime.datetime.utcnow() - time_start}: Number: {number}")
+            else:
+                logging.debug(f"Manual Cup, time {datetime.datetime.utcnow() - time_start}: Response: {number}")
 
     def __save_image__(self, download_path, name, raw):
         with open(os.path.join(download_path, name), 'wb') as f:
             shutil.copyfileobj(raw, f)
+        logging.info(f"Saved photo: {name} size: {human_size(len(raw))} - {download_path}")
 
-    def parse_message_from_byte(self, content, unrecognized_photo_save=False):
+    def __save_image_from_bytes__(self, download_path, name, raw):
+        with open(os.path.join(download_path, name), 'wb') as f:
+            f.write(raw)
+            f.close()
+        logging.info(f"Saved photo: {name} size: {human_size(len(raw))} - {download_path}")
+
+    def parse_message_from_byte(self, content, unrecognized_photo_save=False, download_path=''):
         """
          1 - Пробуем разобрать xml в посылке на 272 байт
          2- При ошибке ищем слово unknown
          3 - Альтернативные посылки пока сохраняем
+        :param download_path:
         :param content:
         :param unrecognized_photo_save:
         :return:
@@ -267,7 +208,7 @@ class HikvisionClient:
                 xml_dict = xmltodict.parse(response)
                 if 'ResponseStatus' in xml_dict and "statusString" in xml_dict["ResponseStatus"] and \
                         xml_dict["ResponseStatus"]['statusString'] == "OK":
-                    return "Ok"
+                    return "Ok", False
                 else:
                     logging.info(f'Error parse: {response}')
             except UnicodeDecodeError:
@@ -281,10 +222,19 @@ class HikvisionClient:
                     recognize = False
                 else:
                     recognize = True
-                    logging.info(f'!!! Detected number: {response}')
+                    # logging.info(f'!!! Detected number: {response}')
                     # logging.debug(content)
-                return response
+                if unrecognized_photo_save or recognize:
+                    date = datetime.datetime.now().strftime("%Y_%d_%m-%H_%M_%S")
+                    filename = f"{response}_{date}.jpg"
+                    # s.find(b'\xff\xd8\xff')
+                    # FF D8 FF - 764
+                    # FF D9
+                    if len(content) > 764:
+                        raw = content[764:]
+                        self.__save_image_from_bytes__(download_path=download_path, name=filename, raw=raw)
+                return response, recognize
             except UnicodeDecodeError:
                 logging.info("Parse error")
                 logging.debug(content)
-        return None
+        return None, False
